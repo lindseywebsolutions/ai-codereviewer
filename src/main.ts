@@ -2,7 +2,9 @@ import { readFileSync } from "fs";
 import * as core from "@actions/core";
 import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, { Chunk, File } from "parse-diff";
+import { Chunk, File } from "parse-diff";
+import parseDiff = require("parse-diff");
+
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
@@ -79,35 +81,30 @@ async function analyzeCode(
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
+  return `You are an AI tasked with reviewing GitHub pull requests. Follow these guidelines for your review:
+- Respond in JSON format: {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review_comment>"}]}
+- Only provide critique; do not include compliments or positive feedback.
+- Comment only when improvement is necessary. If no issues are found, return an empty "reviews" array.
+- Use GitHub Markdown format for comments.
+- Base your review on the code and the context provided by the pull request details. Do not suggest adding code comments.
 
-Review the following code diff in the file "${
-    file.to
-  }" and take the pull request title and description into account when writing the response.
-  
+Review the following code changes in the file "${file.to}" considering the pull request title and description.
+
 Pull request title: ${prDetails.title}
 Pull request description:
-
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
-
+Code diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
+  .map((c: any) => `${c.ln || c.ln2} ${c.content}`)
   .join("\n")}
 \`\`\`
-`;
+
+Please ensure your review comments are specific, actionable, and relevant to the changes made.`;
 }
 
 async function getAIResponse(prompt: string): Promise<Array<{
