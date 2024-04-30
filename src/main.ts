@@ -135,17 +135,21 @@ async function getAIResponse(prompt: string): Promise<Array<{
       ],
     });
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    console.log("AI Response:", res);
+    const rawResponse = response.choices[0].message?.content?.trim() || "{}";
+    console.log("Raw AI Response:", rawResponse);
 
-    const parsed = JSON.parse(res);
-    const reviews = parsed?.reviews;
-
-    console.log("AI Reviews:", reviews);
-    
-    return reviews;
+    try {
+      const parsed = JSON.parse(rawResponse);
+      const reviews = parsed?.reviews;
+      console.log("Parsed Reviews:", reviews);
+      return reviews;
+    } catch (parseError) {
+      console.error("Parsing Error:", parseError);
+      console.error("Faulty JSON:", rawResponse);
+      return null;
+    }
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Error in getAIResponse:", error);
     return null;
   }
 }
