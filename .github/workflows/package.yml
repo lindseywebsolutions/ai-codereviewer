@@ -1,4 +1,4 @@
-name: Publish Workflow
+name: Package Workflow
 
 on:
     workflow_dispatch:
@@ -28,5 +28,5 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Publish Project
-        run: npm run publish
+      - name: Package Project
+        run: npm run package
