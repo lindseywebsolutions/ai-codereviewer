@@ -25,12 +25,15 @@ interface PRDetails {
   pull_number: number;
   title: string;
   description: string;
-}
+};
 
 async function getPRDetails(): Promise<PRDetails> {
+  try {
   const { repository, number } = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
   );
+  console.log("Repository:", repository);
+  console.log("Number:", number);
   const prResponse = await octokit.pulls.get({
     owner: repository.owner.login,
     repo: repository.name,
@@ -43,6 +46,10 @@ async function getPRDetails(): Promise<PRDetails> {
     title: prResponse.data.title ?? "",
     description: prResponse.data.body ?? "",
   };
+  } catch (error) {
+    core.error(`Failed to get PR details: ${error}`);
+    throw error;
+  }
 }
 
 async function getDiff(
@@ -203,9 +210,17 @@ async function fetchAndResolveExistingComments(owner: string, repo: string, pull
 async function main() {
   const prDetails = await getPRDetails();
   let diff: string | null;
-  const eventData = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
-  );
+  let eventData: any;
+
+  try {
+    eventData = JSON.parse(
+      readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
+    );
+    console.log("Event Data:", eventData);
+  } catch (error) {
+    console.error("Error parsing event data:", error);
+    return;
+  }
 
   if (eventData.action === "opened" || eventData.action === "synchronize") {
     // Resolve existing comments before processing new diff
