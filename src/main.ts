@@ -134,10 +134,21 @@ const getAIResponse = async (prompt) => {
       response_format: { type: 'json_object' },
     };
     const response = await openai.chat.completions.create(params);
-    return JSON.parse(response.choices[0].message.content).reviews || [];
-  } catch (error) {
-    console.error('Error in getAIResponse:', error);
-    return [];
+        const rawResponse = response.choices[0].message?.content;
+        if (!rawResponse) {
+            console.warn('No response from AI, received empty response.');
+            return [];
+        }
+        console.log('Raw AI Response:', rawResponse);
+        return JSON.parse(rawResponse).reviews || [];
+    } catch (error) {
+      console.error('Error in getAIResponse:', error);
+      if (error instanceof SyntaxError) {
+          console.error('Failed to parse JSON:', error.message);
+          return [];
+      } else {
+          throw new Error(`Error processing AI response: ${error.message}`);
+      }
   }
 };
 
