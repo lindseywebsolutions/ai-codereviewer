@@ -136,10 +136,12 @@ async function getAIResponse(prompt: string): Promise<Array<{
     });
 
     const res = response.choices[0].message?.content?.trim() || "{}";
+    console.log("AI Response:", res);
+
     const parsed = JSON.parse(res);
     const reviews = parsed?.reviews;
 
-    console.log("AI Response:", reviews);
+    console.log("AI Reviews:", reviews);
     
     return reviews;
   } catch (error) {
