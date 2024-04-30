@@ -24249,7 +24249,9 @@ async function getAIResponse(prompt) {
                 },
             ] }));
         const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-        return JSON.parse(res).reviews;
+        const parsed = JSON.parse(res);
+        const reviews = parsed === null || parsed === void 0 ? void 0 : parsed.reviews;
+        return reviews;
     }
     catch (error) {
         console.error("Error:", error);
