@@ -5,6 +5,8 @@ import { Octokit } from "@octokit/rest";
 import { Chunk, File } from "parse-diff";
 import parseDiff = require("parse-diff");
 import minimatch from "minimatch";
+import { ChatCompletionCreateParamsNonStreaming } from "openai/resources";
+import { RequestOptions } from "openai/core";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
@@ -111,38 +113,32 @@ async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
-  const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.2,
-    max_tokens: MAX_TOKENS,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
-  };
-
   try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-turbo-preview" || OPENAI_API_MODEL === "gpt-4-turbo" || OPENAI_API_MODEL === "gpt-3.5-turbo" || OPENAI_API_MODEL === "gpt-4-0125-preview" || OPENAI_API_MODEL === "gpt-4-1106-preview" || OPENAI_API_MODEL === "gpt-3.5-turbo-0125" || OPENAI_API_MODEL === "gpt-3.5-turbo-1106"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
-    });
+    const params: ChatCompletionCreateParamsNonStreaming = {
+      model: OPENAI_API_MODEL,
+      temperature: 0.2,
+      max_tokens: MAX_TOKENS,
+      top_p: 1,
+      frequency_penalty: 0,
+      presence_penalty: 0,
+      messages: [{ role: "system", content: prompt }],
+      response_format: {
+        type: "json_object"
+      }
+    };
 
-    const rawResponse = response.choices[0].message?.content?.trim() || "{}";
+    const options: RequestOptions = {
+      timeout: 60000,
+    };
+    
+    const response = await openai.chat.completions.create(params, options);
+    const rawResponse = response.choices[0].message?.content?.trim();
     console.log("Raw AI Response:", rawResponse);
 
     try {
       const parsed = JSON.parse(rawResponse);
-      const reviews = parsed?.reviews;
-      console.log("Parsed Reviews:", reviews);
-      return reviews;
+      console.log("Parsed Reviews:", parsed?.reviews);
+      return parsed?.reviews;
     } catch (parseError) {
       console.error("Parsing Error:", parseError);
       console.error("Faulty JSON:", rawResponse);
