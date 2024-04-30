@@ -1,125 +1,104 @@
-import { readFileSync } from "fs";
-import * as core from "@actions/core";
-import OpenAI from "openai";
-import { Octokit } from "@octokit/rest";
-import { Chunk, File } from "parse-diff";
-import parseDiff = require("parse-diff");
-import minimatch from "minimatch";
-import { ChatCompletionCreateParamsNonStreaming } from "openai/resources";
-import { RequestOptions } from "openai/core";
+import { readFileSync } from 'fs';
+import * as core from '@actions/core';
+import OpenAI from 'openai';
+import { Octokit } from '@octokit/rest';
+import parseDiff = require('parse-diff');
+import { ChatCompletionCreateParamsNonStreaming } from 'openai/resources';
+import { RequestError } from '@octokit/request-error';
 
-const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
-const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
-const MAX_TOKENS: number = Number(core.getInput("max_tokens"));
+const GITHUB_TOKEN = core.getInput('GITHUB_TOKEN');
+const OPENAI_API_KEY = core.getInput('OPENAI_API_KEY');
+const OPENAI_API_MODEL = core.getInput('OPENAI_API_MODEL');
+const MAX_TOKENS = Number(core.getInput('max_tokens'));
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
-
-interface PRDetails {
-  owner: string;
-  repo: string;
-  pull_number: number;
-  title: string;
-  description: string;
+const getEventPayload = () => {
+  const eventPath = process.env.GITHUB_EVENT_PATH || '';
+  try {
+    return JSON.parse(readFileSync(eventPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Failed to read or parse event data: ${error}`);
+  }
 };
 
-async function getPRDetails(): Promise<PRDetails> {
+const getPRDetails = async () => {
   try {
-    const { repository, number } = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8"));
-    console.log("Repository:", repository);
-    console.log("Number:", number);
-    const prResponse = await octokit.pulls.get({
-      owner: repository.owner.login,
-      repo: repository.name,
-      pull_number: number,
-    });
+    const eventPath = process.env.GITHUB_EVENT_PATH || '';
+    const eventData = JSON.parse(readFileSync(eventPath, 'utf8'));
+    const { pull_request } = eventData;
+    const { owner, repo } = pull_request.base.repo;
+
     return {
-      owner: repository.owner.login,
-      repo: repository.name,
-      pull_number: number,
-      title: prResponse.data.title ?? "No Title",
-      description: prResponse.data.body ?? "No Description",
+      owner: owner.login,
+      repo: repo.name,
+      pull_number: pull_request.number,
+      title: pull_request.title,
+      description: pull_request.body,
+      action: eventData.action
     };
   } catch (error) {
-    core.error(`Failed to get PR details: ${error}`);
-    throw new Error(`Error retrieving PR details: ${error.message}`);
+    console.error(`Error retrieving PR details: ${error}`);
+    throw new Error(`Failed to get PR details: ${error.message}`);
   }
-}
+};
 
-function calculatePRScore(diffStats) {
-  const { linesAdded, linesDeleted, linesChanged, filesChanged } = diffStats;
-  // Weights can be adjusted as per team's code review guidelines
-  const score = (0.5 * linesAdded) + (0.3 * linesDeleted) + (0.2 * linesChanged) - (5 * filesChanged);
-  return score;
-}
+const calculatePRScore = ({ linesAdded, linesDeleted, linesChanged, filesChanged }) =>
+  0.5 * linesAdded + 0.3 * linesDeleted + 0.2 * linesChanged - 5 * filesChanged;
 
-function extractDiffStats(parsedDiff) {
-  let linesAdded = 0;
-  let linesDeleted = 0;
-  let linesChanged = 0;
-  let filesChanged = parsedDiff.length;
+const extractDiffStats = (parsedDiff) => {
+  let stats = { linesAdded: 0, linesDeleted: 0, linesChanged: 0, filesChanged: parsedDiff.length };
+  parsedDiff.forEach(file => file.chunks.forEach(chunk => chunk.changes.forEach(change => {
+    if (change.add) stats.linesAdded++;
+    else if (change.del) stats.linesDeleted++;
+    else stats.linesChanged++;
+  })));
+  return stats;
+};
 
-  parsedDiff.forEach(file => {
-      file.chunks.forEach(chunk => {
-          chunk.changes.forEach(change => {
-              if (change.add) linesAdded++;
-              else if (change.del) linesDeleted++;
-              else linesChanged++;
-          });
-      });
-  });
+const getDiff = async (owner: string, repo: string, pull_number: number): Promise<string> => {
+  try {
+    const response = await octokit.pulls.get({
+      owner, 
+      repo, 
+      pull_number,
+      mediaType: { format: 'diff' }
+    });
+    return (response.data as unknown) as string;
+  } catch (error) {
+    core.error(`Failed to fetch diff: ${error}`);
+    if (error instanceof RequestError) {
+      throw new Error(`Error fetching diff: ${error.message}, Status: ${error.status}`);
+    } else {
+      throw new Error(`Unexpected error when fetching diff: ${error}`);
+    }
+  }
+};
 
-  return { linesAdded, linesDeleted, linesChanged, filesChanged };
-}
-
-async function getDiff(
-  owner: string,
-  repo: string,
-  pull_number: number
-): Promise<string | null> {
-  const response = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number,
-    mediaType: { format: "diff" },
-  });
-  // @ts-expect-error - response.data is a string
-  return response?.data;
-}
-
-async function analyzeCode(parsedDiff: File[], prDetails: PRDetails): Promise<Array<{ body: string; path: string; line: number }>> {
+const analyzeCode = async (parsedDiff, prDetails) => {
   const comments = [];
 
   for (const file of parsedDiff) {
-      if (file.to === "/dev/null") continue; // Skip deleted files
-      for (const chunk of file.chunks) {
-          const prompt = createPrompt(file, chunk, prDetails);
-          const aiResponses = await getAIResponse(prompt);
+    if (file.to === '/dev/null') continue;
+    for (const chunk of file.chunks) {
+      const prompt = createPrompt(file, chunk, prDetails);
+      const aiResponses = await getAIResponse(prompt);
 
-          if (aiResponses) {
-              for (const response of aiResponses) {
-                  const fix = await suggestCodeFix(file, chunk, response);
-                  const fullComment = `${response.reviewComment}\n\nSuggested Fix:\n\`\`\`typescript\n${fix}\n\`\`\``;
-                  comments.push({
-                      body: fullComment,
-                      path: file.to,
-                      line: Number(response.lineNumber),
-                      diff_hunk: chunk.content // Include diff hunk if necessary for context
-                  });
-              }
-          }
+      if (aiResponses) {
+        for (const response of aiResponses) {
+          const fix = await suggestCodeFix(file, chunk, response);
+          const fullComment = `${response.reviewComment}\n\nSuggested Fix:\n\`\`\`typescript\n${fix}\n\`\`\``;
+          comments.push({ body: fullComment, path: file.to, line: Number(response.lineNumber), diff_hunk: chunk.content });
+        }
       }
+    }
   }
-
   return comments;
-}
+};
 
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `You are an AI tasked with reviewing GitHub pull requests. Follow these guidelines for your review:
+const createPrompt = (file, chunk, prDetails) => `
+You are an AI tasked with reviewing GitHub pull requests. Follow these guidelines for your review:
 - Respond in JSON format: {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review_comment>"}]}
 - Only provide critique; do not include compliments or positive feedback.
 - Comment only when improvement is necessary. If no issues are found, return an empty "reviews" array.
@@ -137,18 +116,12 @@ ${prDetails.description}
 Code diff to review:
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-  .map((c: any) => `${c.ln || c.ln2} ${c.content}`)
-  .join("\n")}
+${chunk.changes.map(c => `${c.ln || c.ln2} ${c.content}`).join('\n')}
 \`\`\`
 
 Please ensure your review comments are specific, actionable, and relevant to the changes made.`;
-}
 
-async function getAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-}> | null> {
+const getAIResponse = async (prompt) => {
   try {
     const params: ChatCompletionCreateParamsNonStreaming = {
       model: OPENAI_API_MODEL,
@@ -157,166 +130,98 @@ async function getAIResponse(prompt: string): Promise<Array<{
       top_p: 1,
       frequency_penalty: 0,
       presence_penalty: 0,
-      messages: [{ role: "system", content: prompt }],
-      response_format: {
-        type: "json_object"
-      },
-      user: "github-actions",
+      messages: [{ role: 'system', content: prompt }],
+      response_format: { type: 'json_object' },
     };
-
-    const options: RequestOptions = {
-      timeout: 60000,
-    };
-
-    const response = await openai.chat.completions.create(params, options);
-    console.log("API Raw Response:", response); // Log the complete response object for inspection
-    const rawResponse = response.choices[0].message?.content || "";
-    console.log("Raw AI Response:", rawResponse); // Log the raw response string
-
-    try {
-      const parsed = JSON.parse(rawResponse);
-      console.log("Parsed Reviews:", parsed?.reviews);
-      return parsed?.reviews;
-    } catch (parseError) {
-      console.error("Parsing Error:", parseError);
-      console.error("Faulty JSON:", rawResponse); // More detailed error logging
-      return null;
-    }
+    const response = await openai.chat.completions.create(params);
+    return JSON.parse(response.choices[0].message.content).reviews || [];
   } catch (error) {
-    console.error("Error in getAIResponse:", error);
-    return null;
+    console.error('Error in getAIResponse:', error);
+    return [];
   }
-}
+};
 
-function createComment(file: File, chunk: Chunk, aiResponses: Array<{
-  lineNumber: string,
-  reviewComment: string
-}>): Array<{ body: string; path: string; line: number; diff_hunk: string }> {
-  return aiResponses.map((response) => {
-    const line = Number(response.lineNumber);
-    const hunk = chunk.content;
-
-    return {
-      body: response.reviewComment,
-      path: file.to,
-      line: line,
-      diff_hunk: hunk
-    };
-  });
-}
-
-async function createReviewComment(
-  owner: string,
-  repo: string,
-  pull_number: number,
-  comments: Array<{ body: string; path: string; line: number }>
-): Promise<void> {
-  await octokit.pulls.createReview({
-    owner,
-    repo,
-    pull_number,
-    comments,
-    event: "COMMENT",
-  });
-}
-
-async function fetchAndResolveExistingComments(owner: string, repo: string, pull_number: number) {
-  const { data: existingComments } = await octokit.pulls.listReviewComments({
-    owner,
-    repo,
-    pull_number,
-  });
-  
-  for (const comment of existingComments) {
-    await octokit.pulls.updateReviewComment({
-      owner,
-      repo,
-      comment_id: comment.id,
-      body: comment.body + "\n\n> **Resolved automatically by system.**",
+const createReviewComment = async (owner, repo, pull_number, comments) => {
+  try {
+    await octokit.pulls.createReview({
+      owner, repo, pull_number, comments, event: 'COMMENT',
     });
-  }
-}
-
-async function main() {
-  const prDetails = await getPRDetails();
-  let eventData: any;
-
-  try {
-    eventData = JSON.parse(
-      readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
-    );
-    console.log("Event Data:", eventData);
   } catch (error) {
-    console.error("Error parsing event data:", error);
-    return;
+    console.error('Error creating review comment:', error);
   }
+};
 
-  if (eventData.action === "opened" || eventData.action === "synchronize") {
-    // Resolve existing comments before processing new diff
-    await fetchAndResolveExistingComments(prDetails.owner, prDetails.repo, prDetails.pull_number);
-
-    const diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
-    if (!diff) {
-        console.log("No diff found");
-        return;
+const fetchAndResolveExistingComments = async (owner, repo, pull_number) => {
+  try {
+    const { data: existingComments } = await octokit.pulls.listReviewComments({ owner, repo, pull_number });
+    for (const comment of existingComments) {
+      await octokit.pulls.updateReviewComment({
+        owner, repo, comment_id: comment.id, body: `${comment.body}\n\n> **Resolved automatically by system.**`,
+      });
     }
-    
-    const parsedDiff = parseDiff(diff);
-    const diffStats = extractDiffStats(parsedDiff);
-    const score = calculatePRScore(diffStats);
-    
-    // Visualization of the score using a markdown progress bar
-    const scoreComment = 
-      `### Pull Request Score: ${score}\n` +
-      `![Progress](https://progress-bar.dev/${Math.min(Math.max(score, 0), 100)}?scale=100&width=400&color=brightgreen&suffix=%)`;
-
-    const comments = await analyzeCode(parsedDiff, prDetails);
-    comments.push({ body: scoreComment, path: '', line: 0 });
-    if (comments.length > 0) {
-      await createReviewComment(
-        prDetails.owner,
-        prDetails.repo,
-        prDetails.pull_number,
-        comments
-      );
-    }
-  } else {
-    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
-    return;
+  } catch (error) {
+    console.error('Error resolving comments:', error);
   }
-}
+};
 
-async function suggestCodeFix(file: File, chunk: Chunk, aiResponse: {
-  lineNumber: string,
-  reviewComment: string
-}): Promise<string> {
+const suggestCodeFix = async (file, chunk, aiResponse) => {
   const prompt = `
-      Given the following code snippet and a critique, suggest a fix:
-      Code Snippet:
-      \`\`\`typescript
-      ${chunk.content}
-      \`\`\`
-      Critique: ${aiResponse.reviewComment}
-      Please provide a TypeScript code suggestion that addresses this critique.
-  `;
+Given the following code snippet and a critique, suggest a fix:
+Code Snippet:
+\`\`\`typescript
+${chunk.content}
+\`\`\`
+Critique: ${aiResponse.reviewComment}
+Please provide a TypeScript code suggestion that addresses this critique.`;
 
   try {
-      const params = {
-          model: OPENAI_API_MODEL,
-          prompt: prompt,
-          max_tokens: 150,
-          temperature: 0.5,
-      };
-
-      const response = await openai.completions.create(params);
-      return response.choices[0].text.trim();
+    const params = {
+      model: OPENAI_API_MODEL,
+      prompt: prompt,
+      max_tokens: 150,
+      temperature: 0.5,
+    };
+    const response = await openai.completions.create(params);
+    return response.choices[0].text.trim();
   } catch (error) {
-      console.error("Error in suggestCodeFix:", error);
-      return "Unable to generate a fix.";
+    console.error('Error in suggestCodeFix:', error);
+    return 'Unable to generate a fix.';
   }
-}
+};
+
+const main = async () => {
+  try {
+    const prDetails = await getPRDetails();
+    if (['opened', 'synchronize'].includes(prDetails.action)) {
+      await fetchAndResolveExistingComments(prDetails.owner, prDetails.repo, prDetails.pull_number);
+
+      const diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
+      if (!diff) {
+        console.log('No diff found');
+        return;
+      }
+
+      const parsedDiff = parseDiff(diff);
+      const diffStats = extractDiffStats(parsedDiff);
+      const score = calculatePRScore(diffStats);
+      const scoreComment = `### Pull Request Score: ${score}
+![Progress](https://progress-bar.dev/${Math.min(Math.max(score, 0), 100)}?scale=100&width=400&color=brightgreen&suffix=%)`;
+
+      const comments = await analyzeCode(parsedDiff, prDetails);
+      comments.push({ body: scoreComment, path: '', line: 0 });
+      if (comments.length > 0) {
+        await createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
+      }
+    } else {
+      console.log('Unsupported event:', prDetails.action);
+    }
+  } catch (error) {
+    console.error('Unhandled error:', error);
+    process.exit(1);
+  }
+};
 
 main().catch((error) => {
-  console.error("Error:", error);
+  console.error('Unhandled error:', error);
   process.exit(1);
 });
