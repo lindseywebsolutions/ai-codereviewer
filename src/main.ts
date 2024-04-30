@@ -9,6 +9,7 @@ import minimatch from "minimatch";
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
+const MAX_TOKENS: number = Number(core.getInput("max_tokens"));
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
@@ -113,7 +114,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
-    max_tokens: 700,
+    max_tokens: MAX_TOKENS,
     top_p: 1,
     frequency_penalty: 0,
     presence_penalty: 0,
@@ -137,6 +138,8 @@ async function getAIResponse(prompt: string): Promise<Array<{
     const res = response.choices[0].message?.content?.trim() || "{}";
     const parsed = JSON.parse(res);
     const reviews = parsed?.reviews;
+
+    console.log("AI Response:", reviews);
     
     return reviews;
   } catch (error) {
@@ -180,6 +183,23 @@ async function createReviewComment(
   });
 }
 
+async function fetchAndResolveExistingComments(owner: string, repo: string, pull_number: number) {
+  const { data: existingComments } = await octokit.pulls.listReviewComments({
+    owner,
+    repo,
+    pull_number,
+  });
+  
+  for (const comment of existingComments) {
+    await octokit.pulls.updateReviewComment({
+      owner,
+      repo,
+      comment_id: comment.id,
+      body: comment.body + "\n\n> **Resolved automatically by system.**",
+    });
+  }
+}
+
 async function main() {
   const prDetails = await getPRDetails();
   let diff: string | null;
@@ -187,58 +207,39 @@ async function main() {
     readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
-  if (eventData.action === "opened") {
+  if (eventData.action === "opened" || eventData.action === "synchronize") {
+    // Resolve existing comments before processing new diff
+    await fetchAndResolveExistingComments(prDetails.owner, prDetails.repo, prDetails.pull_number);
+
     diff = await getDiff(
       prDetails.owner,
       prDetails.repo,
       prDetails.pull_number
     );
-  } else if (eventData.action === "synchronize") {
-    const newBaseSha = eventData.before;
-    const newHeadSha = eventData.after;
 
-    const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: "application/vnd.github.v3.diff",
-      },
-      owner: prDetails.owner,
-      repo: prDetails.repo,
-      base: newBaseSha,
-      head: newHeadSha,
+    if (!diff) {
+      console.log("No diff found");
+      return;
+    }
+
+    const parsedDiff = parseDiff(diff);
+    const excludePatterns = core.getInput("exclude").split(",").map((s) => s.trim());
+    const filteredDiff = parsedDiff.filter((file) => {
+      return !excludePatterns.some((pattern) => minimatch(file.to ?? "", pattern));
     });
 
-    diff = String(response.data);
+    const comments = await analyzeCode(filteredDiff, prDetails);
+    if (comments.length > 0) {
+      await createReviewComment(
+        prDetails.owner,
+        prDetails.repo,
+        prDetails.pull_number,
+        comments
+      );
+    }
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
-  }
-
-  if (!diff) {
-    console.log("No diff found");
-    return;
-  }
-
-  const parsedDiff = parseDiff(diff);
-
-  const excludePatterns = core
-    .getInput("exclude")
-    .split(",")
-    .map((s) => s.trim());
-
-  const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
-    );
-  });
-
-  const comments = await analyzeCode(filteredDiff, prDetails);
-  if (comments.length > 0) {
-    await createReviewComment(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number,
-      comments
-    );
   }
 }
 
