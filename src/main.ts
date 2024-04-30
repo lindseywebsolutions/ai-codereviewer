@@ -113,8 +113,6 @@ async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
-  let rawResponse = "";
-
   try {
     const params: ChatCompletionCreateParamsNonStreaming = {
       model: OPENAI_API_MODEL,
@@ -132,22 +130,23 @@ async function getAIResponse(prompt: string): Promise<Array<{
     const options: RequestOptions = {
       timeout: 60000,
     };
-    
+
     const response = await openai.chat.completions.create(params, options);
-    rawResponse = response.choices[0].message?.content?.trim();
-    console.log("Raw AI Response:", rawResponse);
+    console.log("API Raw Response:", response); // Log the complete response object for inspection
+    const rawResponse = response.choices[0].message?.content || "";
+    console.log("Raw AI Response:", rawResponse); // Log the raw response string
+
+    try {
+      const parsed = JSON.parse(rawResponse);
+      console.log("Parsed Reviews:", parsed?.reviews);
+      return parsed?.reviews;
+    } catch (parseError) {
+      console.error("Parsing Error:", parseError);
+      console.error("Faulty JSON:", rawResponse); // More detailed error logging
+      return null;
+    }
   } catch (error) {
     console.error("Error in getAIResponse:", error);
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(rawResponse);
-    console.log("Parsed Reviews:", parsed?.reviews);
-    return parsed?.reviews;
-  } catch (parseError) {
-    console.error("Parsing Error:", parseError);
-    console.error("Faulty JSON:", rawResponse);
     return null;
   }
 }
