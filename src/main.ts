@@ -148,23 +148,21 @@ async function getAIResponse(prompt: string): Promise<Array<{
   }
 }
 
-function createComment(
-  file: File,
-  chunk: Chunk,
-  aiResponses: Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }>
-): Array<{ body: string; path: string; line: number }> {
+function createComment(file: File, chunk: Chunk, aiResponses: Array<{
+  lineNumber: string,
+  reviewComment: string
+}>): Array<{ body: string; path: string; line: number; diff_hunk: string }> {
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
-      return [];
-    }
-    return {
-      body: aiResponse.reviewComment,
-      path: file.to,
-      line: Number(aiResponse.lineNumber),
-    };
+      if (!file.to) {
+          return [];
+      }
+      const diffHunk = chunk.content;  // You might need to adjust this to match GitHub's expected format
+      return {
+          body: aiResponse.reviewComment,
+          path: file.to,
+          line: Number(aiResponse.lineNumber),
+          diff_hunk: diffHunk  // Adding diff hunk here
+      };
   });
 }
 
