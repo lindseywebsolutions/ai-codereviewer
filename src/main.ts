@@ -29,27 +29,51 @@ interface PRDetails {
 
 async function getPRDetails(): Promise<PRDetails> {
   try {
-  const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
-  );
-  console.log("Repository:", repository);
-  console.log("Number:", number);
-  const prResponse = await octokit.pulls.get({
-    owner: repository.owner.login,
-    repo: repository.name,
-    pull_number: number,
-  });
-  return {
-    owner: repository.owner.login,
-    repo: repository.name,
-    pull_number: number,
-    title: prResponse.data.title ?? "",
-    description: prResponse.data.body ?? "",
-  };
+    const { repository, number } = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8"));
+    console.log("Repository:", repository);
+    console.log("Number:", number);
+    const prResponse = await octokit.pulls.get({
+      owner: repository.owner.login,
+      repo: repository.name,
+      pull_number: number,
+    });
+    return {
+      owner: repository.owner.login,
+      repo: repository.name,
+      pull_number: number,
+      title: prResponse.data.title ?? "No Title",
+      description: prResponse.data.body ?? "No Description",
+    };
   } catch (error) {
     core.error(`Failed to get PR details: ${error}`);
-    throw error;
+    throw new Error(`Error retrieving PR details: ${error.message}`);
   }
+}
+
+function calculatePRScore(diffStats) {
+  const { linesAdded, linesDeleted, linesChanged, filesChanged } = diffStats;
+  // Weights can be adjusted as per team's code review guidelines
+  const score = (0.5 * linesAdded) + (0.3 * linesDeleted) + (0.2 * linesChanged) - (5 * filesChanged);
+  return score;
+}
+
+function extractDiffStats(parsedDiff) {
+  let linesAdded = 0;
+  let linesDeleted = 0;
+  let linesChanged = 0;
+  let filesChanged = parsedDiff.length;
+
+  parsedDiff.forEach(file => {
+      file.chunks.forEach(chunk => {
+          chunk.changes.forEach(change => {
+              if (change.add) linesAdded++;
+              else if (change.del) linesDeleted++;
+              else linesChanged++;
+          });
+      });
+  });
+
+  return { linesAdded, linesDeleted, linesChanged, filesChanged };
 }
 
 async function getDiff(
@@ -67,25 +91,30 @@ async function getDiff(
   return response?.data;
 }
 
-async function analyzeCode(
-  parsedDiff: File[],
-  prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+async function analyzeCode(parsedDiff: File[], prDetails: PRDetails): Promise<Array<{ body: string; path: string; line: number }>> {
+  const comments = [];
 
   for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue;
-    for (const chunk of file.chunks) {
-      const prompt = createPrompt(file, chunk, prDetails);
-      const aiResponse = await getAIResponse(prompt);
-      if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
-          comments.push(...newComments);
-        }
+      if (file.to === "/dev/null") continue; // Skip deleted files
+      for (const chunk of file.chunks) {
+          const prompt = createPrompt(file, chunk, prDetails);
+          const aiResponses = await getAIResponse(prompt);
+
+          if (aiResponses) {
+              for (const response of aiResponses) {
+                  const fix = await suggestCodeFix(file, chunk, response);
+                  const fullComment = `${response.reviewComment}\n\nSuggested Fix:\n\`\`\`typescript\n${fix}\n\`\`\``;
+                  comments.push({
+                      body: fullComment,
+                      path: file.to,
+                      line: Number(response.lineNumber),
+                      diff_hunk: chunk.content // Include diff hunk if necessary for context
+                  });
+              }
+          }
       }
-    }
   }
+
   return comments;
 }
 
@@ -131,7 +160,8 @@ async function getAIResponse(prompt: string): Promise<Array<{
       messages: [{ role: "system", content: prompt }],
       response_format: {
         type: "json_object"
-      }
+      },
+      user: "github-actions",
     };
 
     const options: RequestOptions = {
@@ -209,7 +239,6 @@ async function fetchAndResolveExistingComments(owner: string, repo: string, pull
 
 async function main() {
   const prDetails = await getPRDetails();
-  let diff: string | null;
   let eventData: any;
 
   try {
@@ -226,24 +255,23 @@ async function main() {
     // Resolve existing comments before processing new diff
     await fetchAndResolveExistingComments(prDetails.owner, prDetails.repo, prDetails.pull_number);
 
-    diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
-    );
-
+    const diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
     if (!diff) {
-      console.log("No diff found");
-      return;
+        console.log("No diff found");
+        return;
     }
-
+    
     const parsedDiff = parseDiff(diff);
-    const excludePatterns = core.getInput("exclude").split(",").map((s) => s.trim());
-    const filteredDiff = parsedDiff.filter((file) => {
-      return !excludePatterns.some((pattern) => minimatch(file.to ?? "", pattern));
-    });
+    const diffStats = extractDiffStats(parsedDiff);
+    const score = calculatePRScore(diffStats);
+    
+    // Visualization of the score using a markdown progress bar
+    const scoreComment = 
+      `### Pull Request Score: ${score}\n` +
+      `![Progress](https://progress-bar.dev/${Math.min(Math.max(score, 0), 100)}?scale=100&width=400&color=brightgreen&suffix=%)`;
 
-    const comments = await analyzeCode(filteredDiff, prDetails);
+    const comments = await analyzeCode(parsedDiff, prDetails);
+    comments.push({ body: scoreComment, path: '', line: 0 });
     if (comments.length > 0) {
       await createReviewComment(
         prDetails.owner,
@@ -255,6 +283,36 @@ async function main() {
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
+  }
+}
+
+async function suggestCodeFix(file: File, chunk: Chunk, aiResponse: {
+  lineNumber: string,
+  reviewComment: string
+}): Promise<string> {
+  const prompt = `
+      Given the following code snippet and a critique, suggest a fix:
+      Code Snippet:
+      \`\`\`typescript
+      ${chunk.content}
+      \`\`\`
+      Critique: ${aiResponse.reviewComment}
+      Please provide a TypeScript code suggestion that addresses this critique.
+  `;
+
+  try {
+      const params = {
+          model: OPENAI_API_MODEL,
+          prompt: prompt,
+          max_tokens: 150,
+          temperature: 0.5,
+      };
+
+      const response = await openai.completions.create(params);
+      return response.choices[0].text.trim();
+  } catch (error) {
+      console.error("Error in suggestCodeFix:", error);
+      return "Unable to generate a fix.";
   }
 }
 
