@@ -215,11 +215,14 @@ const main = async () => {
       const parsedDiff = parseDiff(diff);
       const diffStats = extractDiffStats(parsedDiff);
       const score = calculatePRScore(diffStats);
+      console.log('PR Score:', score);
+
       const scoreComment = `### Pull Request Score: ${score}
 ![Progress](https://progress-bar.dev/${Math.min(Math.max(score, 0), 100)}?scale=100&width=400&color=brightgreen&suffix=%)`;
 
       const comments = await analyzeCode(parsedDiff, prDetails);
       comments.push({ body: scoreComment, path: '', line: 0 });
+      
       if (comments.length > 0) {
         await createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
       }
